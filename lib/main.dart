@@ -1,8 +1,18 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
+import 'dart:convert';
+import 'dart:io';
 
-void main() {
-  runApp(const AIMedicalsApp());
-}
+void main() => runApp(const AIMedicalsApp());
+
+const kGroqKey = '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';
+const kGroqUrl = 'https://api.groq.com/openai/v1/chat/completions';
+const kBlue = Color(0xFF1565C0);
+const kRed = Color(0xFFD32F2F);
 
 class AIMedicalsApp extends StatelessWidget {
   const AIMedicalsApp({super.key});
@@ -11,10 +21,7 @@ class AIMedicalsApp extends StatelessWidget {
     return MaterialApp(
       title: 'AI Medicals',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: kBlue), useMaterial3: true),
       home: const MainScreen(),
     );
   }
@@ -27,23 +34,17 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
-  int _currentIndex = 0;
-  final List<Widget> _screens = const [
-    DiagnoseScreen(),
-    HistoryScreen(),
-    ProfileScreen(),
-    EmergencyScreen(),
-  ];
-
+  int _idx = 0;
   @override
   Widget build(BuildContext context) {
+    final screens = [const DiagnoseScreen(), const HistoryScreen(), const ProfileScreen(), const EmergencyScreen()];
     return Scaffold(
-      body: _screens[_currentIndex],
+      body: screens[_idx],
       bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        onTap: (i) => setState(() => _currentIndex = i),
+        currentIndex: _idx,
+        onTap: (i) => setState(() => _idx = i),
         type: BottomNavigationBarType.fixed,
-        selectedItemColor: const Color(0xFF1565C0),
+        selectedItemColor: kBlue,
         unselectedItemColor: Colors.grey,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Diagnose'),
@@ -56,25 +57,34 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// DISCLAIMER BANNER
 class DisclaimerBanner extends StatelessWidget {
   const DisclaimerBanner({super.key});
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: double.infinity,
-      color: const Color(0xFFFFF8E1),
+      width: double.infinity, color: const Color(0xFFFFF8E1),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: const Text(
-        'This is a health information assistant only. Always consult a qualified healthcare professional.',
-        textAlign: TextAlign.center,
-        style: TextStyle(fontSize: 12, color: Color(0xFF795548)),
-      ),
+      child: const Text('This is a health information assistant only. Always consult a qualified healthcare professional.',
+        textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: Color(0xFF795548))),
     );
   }
 }
 
-// DIAGNOSE SCREEN
+// ─── GROQ API ────────────────────────────────────────────────
+Future<String> callGroq(List<Map<String,String>> messages) async {
+  final res = await http.post(
+    Uri.parse(kGroqUrl),
+    headers: {'Authorization': 'Bearer $kGroqKey', 'Content-Type': 'application/json'},
+    body: jsonEncode({'model': 'llama-3.3-70b-versatile', 'messages': messages, 'max_tokens': 1024, 'temperature': 0.7}),
+  );
+  if (res.statusCode == 200) {
+    final data = jsonDecode(res.body);
+    return data['choices'][0]['message']['content'];
+  }
+  return 'Sorry, I could not get a response. Please try again.';
+}
+
+// ─── DIAGNOSE ────────────────────────────────────────────────
 class DiagnoseScreen extends StatefulWidget {
   const DiagnoseScreen({super.key});
   @override
@@ -82,508 +92,227 @@ class DiagnoseScreen extends StatefulWidget {
 }
 
 class _DiagnoseScreenState extends State<DiagnoseScreen> {
-  final _controller = TextEditingController();
+  final _ctrl = TextEditingController();
+  final _msgCtrl = TextEditingController();
   String _severity = 'Moderate';
-  String _bodyArea = 'General';
-  final _bodyAreas = ['General','Head','Chest','Back','Abdomen','Arms','Legs','Skin','Other'];
+  String _body = 'General';
+  bool _chatMode = false;
+  bool _loading = false;
+  List<Map<String, String>> _messages = [];
+  final _bodies = ['General','Head','Chest','Back','Abdomen','Arms','Legs','Skin','Other'];
+  final _scroll = ScrollController();
+
+  Future<void> _startTriage() async {
+    if (_ctrl.text.trim().isEmpty) return;
+    setState(() { _loading = true; _chatMode = true; });
+    _messages = [
+      {'role': 'system', 'content': 'You are a professional medical triage assistant. A patient describes symptoms. Ask focused follow-up questions one at a time to gather more details. After 3-4 questions, provide a structured assessment with: Top 3 possible conditions with likelihood %, recommended actions, urgency level (Low/Medium/High/Emergency), and when to seek immediate care. Always remind the patient to consult a real doctor. Body area: $_body. Severity: $_severity.'},
+      {'role': 'user', 'content': _ctrl.text.trim()},
+    ];
+    final reply = await callGroq(_messages);
+    _messages.add({'role': 'assistant', 'content': reply});
+    
+    // Save to history
+    final prefs = await SharedPreferences.getInstance();
+    final history = prefs.getStringList('history') ?? [];
+    history.insert(0, jsonEncode({
+      'date': DateTime.now().toIso8601String(),
+      'symptom': _ctrl.text.trim(),
+      'body': _body,
+      'severity': _severity,
+      'response': reply,
+    }));
+    if (history.length > 50) history.removeLast();
+    await prefs.setStringList('history', history);
+    
+    setState(() => _loading = false);
+    _scrollToBottom();
+  }
+
+  Future<void> _sendMessage() async {
+    if (_msgCtrl.text.trim().isEmpty) return;
+    final msg = _msgCtrl.text.trim();
+    _msgCtrl.clear();
+    _messages.add({'role': 'user', 'content': msg});
+    setState(() => _loading = true);
+    final reply = await callGroq(_messages);
+    _messages.add({'role': 'assistant', 'content': reply});
+    setState(() => _loading = false);
+    _scrollToBottom();
+  }
+
+  void _scrollToBottom() {
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (_scroll.hasClients) _scroll.animateTo(_scroll.position.maxScrollExtent, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+    });
+  }
+
+  void _reset() {
+    setState(() { _chatMode = false; _messages = []; _ctrl.clear(); _severity = 'Moderate'; _body = 'General'; });
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            const DisclaimerBanner(),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Center(
-                      child: Text('🩺 Symptom Triage',
-                        style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    ),
-                    const Center(
-                      child: Padding(
-                        padding: EdgeInsets.only(top: 4, bottom: 16),
-                        child: Text('Describe your symptoms. Our AI will ask follow-up questions.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.grey)),
-                      ),
-                    ),
-                    const Text('Body Area', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      value: _bodyArea,
-                      decoration: InputDecoration(border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
-                      items: _bodyAreas.map((a) => DropdownMenuItem(value: a, child: Text(a))).toList(),
-                      onChanged: (v) => setState(() => _bodyArea = v!),
-                    ),
-                    const SizedBox(height: 16),
-                    const Text('Describe Your Symptoms *',
-                      style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _controller,
-                      maxLines: 4,
-                      decoration: InputDecoration(
-                        hintText: 'e.g. I have a headache and fever for 2 days...',
-                        filled: true,
-                        fillColor: const Color(0xFFF0F4FF),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    const Text('Severity', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    Row(
-                      children: ['Mild','Moderate','Severe'].map((s) => Expanded(
-                        child: RadioListTile<String>(
-                          title: Text(s, style: const TextStyle(fontSize: 13)),
-                          value: s,
-                          groupValue: _severity,
-                          onChanged: (v) => setState(() => _severity = v!),
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                      )).toList(),
-                    ),
-                    const SizedBox(height: 16),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 52,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF1565C0),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        ),
-                        onPressed: () {},
-                        child: const Text('START AI TRIAGE →',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    const Center(
-                      child: Text('⚠️ For emergencies call 911/999 or use the Emergency tab',
-                        style: TextStyle(color: Colors.red, fontSize: 12)),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// HISTORY SCREEN
-class HistoryScreen extends StatelessWidget {
-  const HistoryScreen({super.key});
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            const DisclaimerBanner(),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    const Text('🕐 Triage History',
-                      style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    const SizedBox(height: 16),
-                    Expanded(
-                      child: ListView(
-                        children: const [
-                          Card(
-                            child: Padding(
-                              padding: EdgeInsets.all(12),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text('No history yet', style: TextStyle(color: Colors.grey)),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 48,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        onPressed: () {},
-                        child: const Text('CLEAR HISTORY', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// PROFILE SCREEN
-class ProfileScreen extends StatelessWidget {
-  const ProfileScreen({super.key});
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            const DisclaimerBanner(),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Center(child: Text('👤 My Profile',
-                      style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Color(0xFF1565C0)))),
-                    const SizedBox(height: 16),
-                    _field('Full Name', 'Enter your name'),
-                    _field('Age', 'Enter your age'),
-                    const Text('Blood Type', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      decoration: InputDecoration(border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
-                      items: ['A+','A-','B+','B-','O+','O-','AB+','AB-']
-                        .map((b) => DropdownMenuItem(value: b, child: Text(b))).toList(),
-                      onChanged: (_) {},
-                      hint: const Text('Select blood type'),
-                    ),
-                    const SizedBox(height: 12),
-                    _field('Known Medical Conditions', 'e.g. asthma, diabetes', lines: 2),
-                    _field('Allergies', 'e.g. penicillin, shellfish', lines: 2),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 52,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF1565C0),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        ),
-                        onPressed: () {},
-                        child: const Text('SAVE PROFILE',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _field(String label, String hint, {int lines = 1}) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0))),
-        const SizedBox(height: 8),
-        TextField(
-          maxLines: lines,
-          decoration: InputDecoration(
-            hintText: hint,
-            filled: true,
-            fillColor: const Color(0xFFF0F4FF),
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
-          ),
-        ),
-        const SizedBox(height: 12),
-      ],
-    );
-  }
-}
-// EMERGENCY SCREEN
-class EmergencyScreen extends StatefulWidget {
-  const EmergencyScreen({super.key});
-  @override
-  State<EmergencyScreen> createState() => _EmergencyScreenState();
-}
-
-class _EmergencyScreenState extends State<EmergencyScreen> {
-  final _langs = {
-    'English':    {'emergency':'EMERGENCY','ambulance':'AMBULANCE','police':'POLICE','fire':'FIRE','hospital':'HOSPITAL','poison':'POISON CONTROL'},
-    'French':     {'emergency':'URGENCE','ambulance':'AMBULANCE','police':'POLICE','fire':'POMPIERS','hospital':'HOPITAL','poison':'ANTIPOISON'},
-    'Spanish':    {'emergency':'EMERGENCIA','ambulance':'AMBULANCIA','police':'POLICIA','fire':'BOMBEROS','hospital':'HOSPITAL','poison':'TOXICOLOGIA'},
-    'Dutch':      {'emergency':'NOODGEVAL','ambulance':'AMBULANCE','police':'POLITIE','fire':'BRANDWEER','hospital':'ZIEKENHUIS','poison':'VERGIFTIGING'},
-    'Hindi':      {'emergency':'AAPATKAAL','ambulance':'AMBULANCE','police':'POLICE','fire':'AGNI','hospital':'ASPATAAL','poison':'VISH NIYANTRAN'},
-    'Mandarin':   {'emergency':'JINJI','ambulance':'JIUHOCHE','police':'JINGCHA','fire':'XIAOFANG','hospital':'YIYUAN','poison':'ZHONGDU'},
-    'Russian':    {'emergency':'EKSTRENNAYA','ambulance':'SKORAYA','police':'POLITSIYA','fire':'POZHARNAYA','hospital':'BOLNITSA','poison':'OT OTRAVLENIY'},
-    'Arabic':     {'emergency':'TAWAREI','ambulance':'ISAF','police':'SHURTA','fire':'ITFA','hospital':'MUSTASHFA','poison':'SUMUM'},
-    'Islam':      {'emergency':'NAJDA','ambulance':'ISAF TIBBI','police':'SHURTA','fire':'ITFAA','hospital':'MUSTASHFA','poison':'SAMM'},
-    'Greek':      {'emergency':'EKTAKTO','ambulance':'ASTHENOFORO','police':'ASTYNOMIA','fire':'PYROSVESTIKI','hospital':'NOSOKOMIO','poison':'DILHTIRIASEIS'},
-    'Portuguese': {'emergency':'EMERGENCIA','ambulance':'AMBULANCIA','police':'POLICIA','fire':'BOMBEIROS','hospital':'HOSPITAL','poison':'VENENOS'},
-    'Papiamento': {'emergency':'EMERGENCIA','ambulance':'AMBULANS','police':'POLITIE','fire':'BOMBERO','hospital':'HOSPITAL','poison':'VENENO'},
-    'Creole':     {'emergency':'IJANS','ambulance':'ANBILANS','police':'LAPOLIS','fire':'PONPYE','hospital':'LOPITAL','poison':'PWAZON'},
-  };
-
-  final _data = {
-    'St. Vincent and the Grenadines': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'emergency','n':'999','c':'#D32F2F'},
-      {'t':'ambulance','n':'784-456-1185','c':'#E65100'},{'t':'police','n':'784-457-1211','c':'#1565C0'},
-      {'t':'fire','n':'784-456-1009','c':'#BF360C'},{'t':'hospital','n':'MILTON CATO 784-456-1185','c':'#2E7D32'},
-    ],
-    'Barbados': [
-      {'t':'emergency','n':'211','c':'#D32F2F'},{'t':'ambulance','n':'511','c':'#E65100'},
-      {'t':'police','n':'211','c':'#1565C0'},{'t':'fire','n':'311','c':'#BF360C'},
-      {'t':'hospital','n':'QEH 246-436-6450','c':'#2E7D32'},{'t':'poison','n':'246-436-6450','c':'#6A1B9A'},
-    ],
-    'Trinidad and Tobago': [
-      {'t':'emergency','n':'999','c':'#D32F2F'},{'t':'ambulance','n':'811','c':'#E65100'},
-      {'t':'police','n':'999','c':'#1565C0'},{'t':'fire','n':'990','c':'#BF360C'},
-      {'t':'hospital','n':'POS GEN HOSP 868-623-2951','c':'#2E7D32'},{'t':'poison','n':'868-623-2951','c':'#6A1B9A'},
-    ],
-    'Jamaica': [
-      {'t':'emergency','n':'119','c':'#D32F2F'},{'t':'ambulance','n':'110','c':'#E65100'},
-      {'t':'police','n':'119','c':'#1565C0'},{'t':'fire','n':'110','c':'#BF360C'},
-      {'t':'hospital','n':'KPH 876-922-1434','c':'#2E7D32'},{'t':'poison','n':'876-927-1620','c':'#6A1B9A'},
-    ],
-    'Guyana': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'913','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'912','c':'#BF360C'},
-      {'t':'hospital','n':'GPHC 592-226-3271','c':'#2E7D32'},{'t':'poison','n':'592-226-3271','c':'#6A1B9A'},
-    ],
-    'Antigua and Barbuda': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'462-0251','c':'#E65100'},
-      {'t':'police','n':'462-0125','c':'#1565C0'},{'t':'fire','n':'462-0044','c':'#BF360C'},
-      {'t':'hospital','n':'MT ST JOHN 462-0251','c':'#2E7D32'},{'t':'poison','n':'462-0251','c':'#6A1B9A'},
-    ],
-    'St. Lucia': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'759-452-2421','c':'#E65100'},
-      {'t':'police','n':'999','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'VICTORIA HOSP 759-452-2421','c':'#2E7D32'},{'t':'poison','n':'759-452-2421','c':'#6A1B9A'},
-    ],
-    'Grenada': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'434','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'GENERAL HOSP 473-440-2051','c':'#2E7D32'},{'t':'poison','n':'473-440-2051','c':'#6A1B9A'},
-    ],
-    'Dominica': [
-      {'t':'emergency','n':'999','c':'#D32F2F'},{'t':'ambulance','n':'448-2231','c':'#E65100'},
-      {'t':'police','n':'999','c':'#1565C0'},{'t':'fire','n':'998','c':'#BF360C'},
-      {'t':'hospital','n':'PMH 767-448-2231','c':'#2E7D32'},{'t':'poison','n':'767-448-2231','c':'#6A1B9A'},
-    ],
-    'St. Kitts and Nevis': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'465-2551','c':'#E65100'},
-      {'t':'police','n':'465-2241','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'JNF HOSPITAL 869-465-2551','c':'#2E7D32'},{'t':'poison','n':'869-465-2551','c':'#6A1B9A'},
-    ],
-    'Bahamas': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'919','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'PMH 242-322-2861','c':'#2E7D32'},{'t':'poison','n':'242-322-2861','c':'#6A1B9A'},
-    ],
-    'Haiti': [
-      {'t':'emergency','n':'114','c':'#D32F2F'},{'t':'ambulance','n':'114','c':'#E65100'},
-      {'t':'police','n':'114','c':'#1565C0'},{'t':'fire','n':'115','c':'#BF360C'},
-      {'t':'hospital','n':'HOPITAL GENERAL 509-2222-4000','c':'#2E7D32'},{'t':'poison','n':'509-2222-4000','c':'#6A1B9A'},
-    ],
-    'Cuba': [
-      {'t':'emergency','n':'106','c':'#D32F2F'},{'t':'ambulance','n':'104','c':'#E65100'},
-      {'t':'police','n':'106','c':'#1565C0'},{'t':'fire','n':'105','c':'#BF360C'},
-      {'t':'hospital','n':'CIMEQ 537-838-3500','c':'#2E7D32'},{'t':'poison','n':'537-838-3500','c':'#6A1B9A'},
-    ],
-    'Dominican Republic': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL CONTRERAS 809-227-2221','c':'#2E7D32'},{'t':'poison','n':'809-562-0101','c':'#6A1B9A'},
-    ],
-    'Aruba': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'100','c':'#1565C0'},{'t':'fire','n':'115','c':'#BF360C'},
-      {'t':'hospital','n':'DR HORACIO ODUBER 297-527-4000','c':'#2E7D32'},{'t':'poison','n':'297-527-4000','c':'#6A1B9A'},
-    ],
-    'Curacao': [
-      {'t':'emergency','n':'912','c':'#D32F2F'},{'t':'ambulance','n':'912','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'912','c':'#BF360C'},
-      {'t':'hospital','n':'CMC 599-9462-5100','c':'#2E7D32'},{'t':'poison','n':'599-9462-5100','c':'#6A1B9A'},
-    ],
-    'Sint Maarten': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'912','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'913','c':'#BF360C'},
-      {'t':'hospital','n':'ST MAARTEN MED CTR 721-543-1111','c':'#2E7D32'},{'t':'poison','n':'721-543-1111','c':'#6A1B9A'},
-    ],
-    'Suriname': [
-      {'t':'emergency','n':'115','c':'#D32F2F'},{'t':'ambulance','n':'113','c':'#E65100'},
-      {'t':'police','n':'115','c':'#1565C0'},{'t':'fire','n':'110','c':'#BF360C'},
-      {'t':'hospital','n':'ACADEMISCH ZIEKENHUIS 597-442-222','c':'#2E7D32'},{'t':'poison','n':'597-442-222','c':'#6A1B9A'},
-    ],
-    'Belize': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'KARL HEUSNER 501-223-1548','c':'#2E7D32'},{'t':'poison','n':'501-223-1548','c':'#6A1B9A'},
-    ],
-    'Montserrat': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'491-2552','c':'#E65100'},
-      {'t':'police','n':'491-2555','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'GLENDON HOSP 664-491-2552','c':'#2E7D32'},{'t':'poison','n':'664-491-2552','c':'#6A1B9A'},
-    ],
-    'Cayman Islands': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'HEALTH CITY 345-943-4628','c':'#2E7D32'},{'t':'poison','n':'345-943-4628','c':'#6A1B9A'},
-    ],
-    'Brazil': [
-      {'t':'emergency','n':'190','c':'#D32F2F'},{'t':'ambulance','n':'192','c':'#E65100'},
-      {'t':'police','n':'190','c':'#1565C0'},{'t':'fire','n':'193','c':'#BF360C'},
-      {'t':'hospital','n':'SAMU 192','c':'#2E7D32'},{'t':'poison','n':'0800-722-6001','c':'#6A1B9A'},
-    ],
-    'Colombia': [
-      {'t':'emergency','n':'123','c':'#D32F2F'},{'t':'ambulance','n':'125','c':'#E65100'},
-      {'t':'police','n':'123','c':'#1565C0'},{'t':'fire','n':'119','c':'#BF360C'},
-      {'t':'hospital','n':'LINEA SALUD 125','c':'#2E7D32'},{'t':'poison','n':'57-1-508-1030','c':'#6A1B9A'},
-    ],
-    'Venezuela': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'171','c':'#E65100'},
-      {'t':'police','n':'171','c':'#1565C0'},{'t':'fire','n':'171','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL VARGAS 212-483-1343','c':'#2E7D32'},{'t':'poison','n':'212-483-1343','c':'#6A1B9A'},
-    ],
-    'Peru': [
-      {'t':'emergency','n':'105','c':'#D32F2F'},{'t':'ambulance','n':'106','c':'#E65100'},
-      {'t':'police','n':'105','c':'#1565C0'},{'t':'fire','n':'116','c':'#BF360C'},
-      {'t':'hospital','n':'ESSALUD 411-8000','c':'#2E7D32'},{'t':'poison','n':'51-1-472-2500','c':'#6A1B9A'},
-    ],
-    'Argentina': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'107','c':'#E65100'},
-      {'t':'police','n':'101','c':'#1565C0'},{'t':'fire','n':'100','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL ITALIANO 54-11-4959-0200','c':'#2E7D32'},{'t':'poison','n':'54-11-4923-1051','c':'#6A1B9A'},
-    ],
-    'Chile': [
-      {'t':'emergency','n':'131','c':'#D32F2F'},{'t':'ambulance','n':'131','c':'#E65100'},
-      {'t':'police','n':'133','c':'#1565C0'},{'t':'fire','n':'132','c':'#BF360C'},
-      {'t':'hospital','n':'SAMU 131','c':'#2E7D32'},{'t':'poison','n':'56-2-2635-3800','c':'#6A1B9A'},
-    ],
-    'Ecuador': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'101','c':'#1565C0'},{'t':'fire','n':'102','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL EUGENIO ESPEJO 593-2-226-2142','c':'#2E7D32'},{'t':'poison','n':'593-2-226-2142','c':'#6A1B9A'},
-    ],
-    'Bolivia': [
-      {'t':'emergency','n':'110','c':'#D32F2F'},{'t':'ambulance','n':'118','c':'#E65100'},
-      {'t':'police','n':'110','c':'#1565C0'},{'t':'fire','n':'119','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL OBRERO 591-2-249-9141','c':'#2E7D32'},{'t':'poison','n':'591-2-249-9141','c':'#6A1B9A'},
-    ],
-    'Paraguay': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'204','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'132','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL NACIONAL 595-21-205-000','c':'#2E7D32'},{'t':'poison','n':'595-21-205-000','c':'#6A1B9A'},
-    ],
-    'Uruguay': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'105','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'104','c':'#BF360C'},
-      {'t':'hospital','n':'HOSPITAL MACIEL 598-2-915-3000','c':'#2E7D32'},{'t':'poison','n':'598-2-487-1515','c':'#6A1B9A'},
-    ],
-    'United States': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'NURSE LINE 811','c':'#2E7D32'},{'t':'poison','n':'1-800-222-1222','c':'#6A1B9A'},
-    ],
-    'Canada': [
-      {'t':'emergency','n':'911','c':'#D32F2F'},{'t':'ambulance','n':'911','c':'#E65100'},
-      {'t':'police','n':'911','c':'#1565C0'},{'t':'fire','n':'911','c':'#BF360C'},
-      {'t':'hospital','n':'TELEHEALTH 811','c':'#2E7D32'},{'t':'poison','n':'1-800-268-9017','c':'#6A1B9A'},
-    ],
-    'United Kingdom': [
-      {'t':'emergency','n':'999','c':'#D32F2F'},{'t':'emergency','n':'112','c':'#D32F2F'},
-      {'t':'ambulance','n':'999','c':'#E65100'},{'t':'police','n':'999','c':'#1565C0'},
-      {'t':'fire','n':'999','c':'#BF360C'},{'t':'hospital','n':'NHS DIRECT 111','c':'#2E7D32'},
-    ],
-    'Australia': [
-      {'t':'emergency','n':'000','c':'#D32F2F'},{'t':'ambulance','n':'000','c':'#E65100'},
-      {'t':'police','n':'000','c':'#1565C0'},{'t':'fire','n':'000','c':'#BF360C'},
-      {'t':'hospital','n':'HEALTHDIRECT 1800-022-222','c':'#2E7D32'},{'t':'poison','n':'13-11-26','c':'#6A1B9A'},
-    ],
-    'India': [
-      {'t':'emergency','n':'112','c':'#D32F2F'},{'t':'ambulance','n':'108','c':'#E65100'},
-      {'t':'police','n':'100','c':'#1565C0'},{'t':'fire','n':'101','c':'#BF360C'},
-      {'t':'hospital','n':'MEDICAL HELPLINE 104','c':'#2E7D32'},{'t':'poison','n':'1800-116-117','c':'#6A1B9A'},
-    ],
-    'Nigeria': [
-      {'t':'emergency','n':'112','c':'#D32F2F'},{'t':'ambulance','n':'112','c':'#E65100'},
-      {'t':'police','n':'199','c':'#1565C0'},{'t':'fire','n':'199','c':'#BF360C'},
-      {'t':'hospital','n':'LUTH 234-1-774-0780','c':'#2E7D32'},{'t':'poison','n':'112','c':'#6A1B9A'},
-    ],
-  };
-
-  final _icons = {'emergency':'🆘','ambulance':'🚑','police':'👮','fire':'🔥','hospital':'🏥','poison':'☠️'};
-  String _lang = 'English';
-  String _country = 'St. Vincent and the Grenadines';
-
-  Color _hex(String h) => Color(int.parse('FF${h.replaceAll('#','')}', radix: 16));
-
-  @override
-  Widget build(BuildContext context) {
-    final t = _langs[_lang]!;
-    final entries = _data[_country] ?? [];
     return Scaffold(
       body: SafeArea(
         child: Column(children: [
           const DisclaimerBanner(),
-          Expanded(child: SingleChildScrollView(
+          if (!_chatMode) Expanded(child: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Center(child: Text('🚨 Emergency Contacts',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFFD32F2F)))),
-              const SizedBox(height: 12),
-              const Text('🗣 Language', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0), fontSize: 13)),
-              const SizedBox(height: 4),
-              DropdownButtonFormField<String>(
-                value: _lang, isExpanded: true,
-                decoration: InputDecoration(
-                  filled: true, fillColor: const Color(0xFFE3F2FD),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none)),
-                items: _langs.keys.map((l) => DropdownMenuItem(value: l, child: Text(l))).toList(),
-                onChanged: (v) => setState(() => _lang = v!),
-              ),
-              const SizedBox(height: 10),
-              const Text('🌍 Country', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0), fontSize: 13)),
-              const SizedBox(height: 4),
-              DropdownButtonFormField<String>(
-                value: _country, isExpanded: true,
-                decoration: InputDecoration(
-                  filled: true, fillColor: const Color(0xFFE8F5E9),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none)),
-                items: _data.keys.map((c) => DropdownMenuItem(value: c, child: Text(c, overflow: TextOverflow.ellipsis))).toList(),
-                onChanged: (v) => setState(() => _country = v!),
-              ),
-              const SizedBox(height: 14),
-              ...entries.map((e) {
-                final icon = _icons[e['t']] ?? '📞';
-                final label = t[e['t']] ?? e['t']!.toUpperCase();
-                return Container(
-                  width: double.infinity,
-                  margin: const EdgeInsets.only(bottom: 8),
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _hex(e['c']!),
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                    onPressed: () {},
-                    child: Text('$icon $label — ${e['n']}',
-                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
-                      textAlign: TextAlign.center)));
-              }),
+              const Center(child: Text('🩺 Symptom Triage', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: kBlue))),
+              const Center(child: Padding(padding: EdgeInsets.only(top: 4, bottom: 16),
+                child: Text('Describe your symptoms. Our AI will ask follow-up questions.', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)))),
+              const Text('Body Area', style: TextStyle(fontWeight: FontWeight.bold, color: kBlue)),
               const SizedBox(height: 8),
-              const Center(child: Text('Tap any button to call directly',
-                style: TextStyle(color: Colors.grey, fontSize: 13))),
+              DropdownButtonFormField<String>(value: _body,
+                decoration: InputDecoration(border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
+                items: _bodies.map((a) => DropdownMenuItem(value: a, child: Text(a))).toList(),
+                onChanged: (v) => setState(() => _body = v!)),
+              const SizedBox(height: 16),
+              const Text('Describe Your Symptoms *', style: TextStyle(fontWeight: FontWeight.bold, color: kBlue)),
+              const SizedBox(height: 8),
+              TextField(controller: _ctrl, maxLines: 4,
+                decoration: InputDecoration(
+                  hintText: 'e.g. I have a headache and fever for 2 days...',
+                  filled: true, fillColor: const Color(0xFFF0F4FF),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none))),
+              const SizedBox(height: 16),
+              const Text('Severity', style: TextStyle(fontWeight: FontWeight.bold, color: kBlue)),
+              const SizedBox(height: 8),
+              Row(children: ['Mild','Moderate','Severe'].map((s) => Expanded(
+                child: InkWell(
+                  onTap: () => setState(() => _severity = s),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Radio<String>(value: s, groupValue: _severity, onChanged: (v) => setState(() => _severity = v!)),
+                    Text(s, style: const TextStyle(fontSize: 13)),
+                  ])))).toList()),
+              const SizedBox(height: 16),
+              SizedBox(width: double.infinity, height: 52,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: kBlue, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                  onPressed: _loading ? null : _startTriage,
+                  child: _loading ? const CircularProgressIndicator(color: Colors.white) :
+                    const Text('START AI TRIAGE →', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)))),
+              const SizedBox(height: 12),
+              const Center(child: Text('⚠️ For emergencies call 911/999 or use the Emergency tab', style: TextStyle(color: Colors.red, fontSize: 12))),
+            ]),
+          )),
+          if (_chatMode) Expanded(child: Column(children: [
+            Container(color: kBlue, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(children: [
+                const Expanded(child: Text('🩺 AI Triage Chat', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))),
+                IconButton(icon: const Icon(Icons.refresh, color: Colors.white), onPressed: _reset),
+              ])),
+            Expanded(child: ListView.builder(
+              controller: _scroll,
+              padding: const EdgeInsets.all(12),
+              itemCount: _messages.where((m) => m['role'] != 'system').length + (_loading ? 1 : 0),
+              itemBuilder: (ctx, i) {
+                final msgs = _messages.where((m) => m['role'] != 'system').toList();
+                if (_loading && i == msgs.length) {
+                  return const Align(alignment: Alignment.centerLeft,
+                    child: Padding(padding: EdgeInsets.all(8),
+                      child: CircularProgressIndicator()));
+                }
+                final msg = msgs[i];
+                final isUser = msg['role'] == 'user';
+                return Align(
+                  alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    constraints: BoxConstraints(maxWidth: MediaQuery.of(ctx).size.width * 0.8),
+                    decoration: BoxDecoration(
+                      color: isUser ? kBlue : const Color(0xFFF0F4FF),
+                      borderRadius: BorderRadius.circular(12)),
+                    child: Text(msg['content'] ?? '',
+                      style: TextStyle(color: isUser ? Colors.white : Colors.black87, fontSize: 14))));
+              })),
+            Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.white,
+              boxShadow: [BoxShadow(color: Colors.grey.shade200, blurRadius: 4)]),
+              child: Row(children: [
+                Expanded(child: TextField(controller: _msgCtrl,
+                  decoration: InputDecoration(hintText: 'Type your response...',
+                    filled: true, fillColor: const Color(0xFFF0F4FF),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(24), borderSide: BorderSide.none),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10)))),
+                const SizedBox(width: 8),
+                CircleAvatar(backgroundColor: kBlue,
+                  child: IconButton(icon: const Icon(Icons.send, color: Colors.white, size: 20), onPressed: _loading ? null : _sendMessage)),
+              ])),
+          ])),
+        ]),
+      ),
+    );
+  }
+}
+
+// ─── HISTORY ────────────────────────────────────────────────
+class HistoryScreen extends StatefulWidget {
+  const HistoryScreen({super.key});
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  List<Map<String,dynamic>> _history = [];
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList('history') ?? [];
+    setState(() => _history = raw.map((e) => jsonDecode(e) as Map<String,dynamic>).toList());
+  }
+
+  Future<void> _clear() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('history');
+    setState(() => _history = []);
+  }
+
+  String _fmt(String iso) {
+    final d = DateTime.parse(iso).toLocal();
+    return '${d.day}/${d.month}/${d.year} ${d.hour}:${d.minute.toString().padLeft(2,'0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Column(children: [
+          const DisclaimerBanner(),
+          Expanded(child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(children: [
+              const Text('🕐 Triage History', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: kBlue)),
+              const SizedBox(height: 16),
+              Expanded(child: _history.isEmpty
+                ? const Center(child: Text('No history yet', style: TextStyle(color: Colors.grey, fontSize: 16)))
+                : ListView.builder(
+                    itemCount: _history.length,
+                    itemBuilder: (ctx, i) {
+                      final h = _history[i];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ExpansionTile(
+                          title: Text(h['symptom'] ?? '', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                          subtitle: Text('${h['body']} • ${h['severity']} • ${_fmt(h['date'])}',
+                            style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          children: [
+                            Padding(padding: const EdgeInsets.all(12),
+                              child: Text(h['response'] ?? '', style: const TextStyle(fontSize: 13)))
+                          ],
+                        ));
+                    })),
+              const SizedBox(height: 8),
+              SizedBox(width: double.infinity, height: 48,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                  onPressed: _clear,
+                  child: const Text('CLEAR HISTORY', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
             ]),
           )),
         ]),
@@ -591,3 +320,101 @@ class _EmergencyScreenState extends State<EmergencyScreen> {
     );
   }
 }
+
+// ─── PROFILE ────────────────────────────────────────────────
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final _name = TextEditingController();
+  final _age = TextEditingController();
+  final _conditions = TextEditingController();
+  final _allergies = TextEditingController();
+  String? _blood;
+  String _homeCountry = 'St. Vincent and the Grenadines';
+  String _currentCountry = 'St. Vincent and the Grenadines';
+  String? _photoPath;
+  final _bloods = ['A+','A-','B+','B-','O+','O-','AB+','AB-'];
+  final _countries = ['St. Vincent and the Grenadines','Barbados','Trinidad and Tobago','Jamaica','Guyana','Antigua and Barbuda','St. Lucia','Grenada','Dominica','St. Kitts and Nevis','Bahamas','Haiti','Cuba','Dominican Republic','Puerto Rico (US)','Aruba','Curacao','Sint Maarten','Suriname','Belize','Montserrat','Cayman Islands','Brazil','Colombia','Venezuela','Peru','Argentina','Chile','Ecuador','Bolivia','Paraguay','Uruguay','United States','Canada','United Kingdom','Australia','India','Nigeria'];
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  Future<void> _load() async {
+    final p = await SharedPreferences.getInstance();
+    setState(() {
+      _name.text = p.getString('name') ?? '';
+      _age.text = p.getString('age') ?? '';
+      _conditions.text = p.getString('conditions') ?? '';
+      _allergies.text = p.getString('allergies') ?? '';
+      _blood = p.getString('blood');
+      _homeCountry = p.getString('homeCountry') ?? 'St. Vincent and the Grenadines';
+      _currentCountry = p.getString('currentCountry') ?? 'St. Vincent and the Grenadines';
+      _photoPath = p.getString('photoPath');
+    });
+  }
+
+  Future<void> _save() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('name', _name.text);
+    await p.setString('age', _age.text);
+    await p.setString('conditions', _conditions.text);
+    await p.setString('allergies', _allergies.text);
+    if (_blood != null) await p.setString('blood', _blood!);
+    await p.setString('homeCountry', _homeCountry);
+    await p.setString('currentCountry', _currentCountry);
+    if (_photoPath != null) await p.setString('photoPath', _photoPath!);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('✅ Profile saved!'), backgroundColor: kBlue));
+  }
+
+  Future<void> _pickPhoto() async {
+    final picker = ImagePicker();
+    final img = await picker.pickImage(source: ImageSource.gallery, imageQuality: 80);
+    if (img != null) setState(() => _photoPath = img.path);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Column(children: [
+          const DisclaimerBanner(),
+          Expanded(child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Center(child: Text('👤 My Profile', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: kBlue))),
+              const SizedBox(height: 16),
+              // Profile Photo
+              Center(child: GestureDetector(
+                onTap: _pickPhoto,
+                child: Stack(children: [
+                  CircleAvatar(radius: 50,
+                    backgroundColor: const Color(0xFFF0F4FF),
+                    backgroundImage: _photoPath != null ? FileImage(File(_photoPath!)) : null,
+                    child: _photoPath == null ? const Icon(Icons.person, size: 50, color: kBlue) : null),
+                  Positioned(bottom: 0, right: 0,
+                    child: CircleAvatar(radius: 16, backgroundColor: kBlue,
+                      child: const Icon(Icons.camera_alt, size: 16, color: Colors.white))),
+                ]),
+              )),
+              const SizedBox(height: 8),
+              const Center(child: Text('Tap photo to change', style: TextStyle(color: Colors.grey, fontSize: 12))),
+              const SizedBox(height: 16),
+              _lbl('Full Name'), _tf(_name, 'Enter your name'),
+              _lbl('Age'), _tf(_age, 'Enter your age', num: true),
+              _lbl('Blood Type'),
+              DropdownButtonFormField<String>(
+                value: _blood,
+                decoration: InputDecoration(filled: true, fillColor: const Color(0xFFF0F4FF),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none)),
+                hint: const Text('Select blood type'),
+                items: _bloods.map((b) => DropdownMenuItem(value: b, child: Text(b))).toList(),
+                onChanged: (v) => setState(() => _blood = v)),
+              const SizedBox(height: 12),
+              _lbl('Known Medical Conditions'),
+              _tf(_conditions, 'e.g. asthma, diabetes', lines: 2),
+     
