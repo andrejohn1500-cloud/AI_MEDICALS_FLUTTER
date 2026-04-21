@@ -126,7 +126,7 @@ Disclaimer: This is AI triage only, not a medical diagnosis.
           'Content-Type': 'application/json',
         },
         body: jsonEncode({
-          'model': 'llama3-8b-8192',
+          'model': 'llama-3.1-8b-instant',
           'messages': [{'role': 'user', 'content': prompt}],
           'max_tokens': 400,
         }),
